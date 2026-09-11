@@ -1,4 +1,5 @@
 import csv
+import gc  # メモリ解放用
 from io import BytesIO, StringIO
 import json
 import os
@@ -328,7 +329,6 @@ function buildUI() {
       </label><br>
       <hr style="border:0; border-top:1px dashed #ccc;">
       <b>QR UUID matni sozlamalari:</b><br>
-      <!-- 変更点1: 配置方向 (上下左右) -->
       <label>Matn joylashuvi: 
         <select onchange="updateConfig(${index}, 'textPosition', this.value)">
           <option value="bottom" ${config.textPosition === 'bottom' ? 'selected' : ''}>Pastda (下)</option>
@@ -337,7 +337,6 @@ function buildUI() {
           <option value="right" ${config.textPosition === 'right' ? 'selected' : ''}>O'ngda (右)</option>
         </select>
       </label><br>
-      <!-- 変更点2: 距離 (オフセット) -->
       <label>Matn masofasi (px): <input type="number" value="${config.textMargin}" onchange="updateConfig(${index}, 'textMargin', this.value)"></label><br>
       <label>Matn o'lchami (px): <input type="number" value="${config.textSize}" min="1" onchange="updateConfig(${index}, 'textSize', this.value)"></label><br>
       <label>Matn rangi: <input type="color" value="${config.textColor}" onchange="updateConfig(${index}, 'textColor', this.value)"></label>
@@ -419,7 +418,6 @@ function renderPreview() {
     ctx.fillStyle = cfg.fillColor;
     ctx.fillRect(cfg.x + 10, cfg.y + 10, cfg.size - 20, cfg.size - 20);
     
-    // テキスト位置と距離の計算
     let tx = cfg.x + (cfg.size / 2);
     let ty = cfg.y + cfg.size + cfg.textSize;
     let align = "center";
@@ -481,20 +479,21 @@ def index():
         outer_params = json.loads(request.form.get("outer_params", "{}"))
         frame_file = request.files.get("frame")
 
-        base_frame = None
+        frame_bytes = None
         if frame_file and frame_file.filename:
-            base_frame = Image.open(frame_file.stream).convert("RGBA")
+            frame_bytes = frame_file.read()  # メモリ節約のためバイト列で保持
 
         zip_buffer = BytesIO()
         csv_data = [["UUID"]]
 
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+        # 圧縮レベルを指定してZIPファイルを作成（ZIP_DEFLATED）
+        with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
             for i in range(qty):
                 uuid_code = generate_uuid()
                 csv_data.append([uuid_code])
 
-                if base_frame:
-                    img = base_frame.copy()
+                if frame_bytes:
+                    img = Image.open(BytesIO(frame_bytes)).convert("RGBA")
                 else:
                     img = Image.new("RGBA", (600, 600), (255, 255, 255, 255))
 
@@ -523,7 +522,6 @@ def index():
                     margin = int(config.get("textMargin", 10))
                     pos = config.get("textPosition", "bottom")
 
-                    # 上下左右の位置計算（Python/Pillow描画）
                     if pos == "bottom":
                         tx = x + (qr_size // 2)
                         ty = y + qr_size + margin
@@ -546,16 +544,30 @@ def index():
                         anchor = "mt"
 
                     draw.text((tx, ty), uuid_code, fill=text_color, anchor=anchor, font=font)
+                    
+                    # 個別パーツのメモリ解放
+                    qr_img.close()
+                    qr_resized.close()
 
                 final_img = img.convert("RGB")
                 img_buffer = BytesIO()
-                final_img.save(img_buffer, format="PNG")
+                final_img.save(img_buffer, format="PNG", optimize=True)
+                
+                # ZIPへ書き込み
                 zip_file.writestr(f"{uuid_code}.png", img_buffer.getvalue())
+
+                # 明示的にメモリ解放を実行
+                img_buffer.close()
+                final_img.close()
+                img.close()
+                del img, final_img, img_buffer
+                gc.collect()
 
             csv_buffer = StringIO()
             writer = csv.writer(csv_buffer)
             writer.writerows(csv_data)
             zip_file.writestr("uuid_codes.csv", csv_buffer.getvalue())
+            csv_buffer.close()
 
         zip_buffer.seek(0)
         return send_file(
@@ -568,4 +580,5 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5050, debug=True)
+    port = int(os.environ.get("PORT", 5050))
+    app.run(host="0.0.0.0", port=port)
