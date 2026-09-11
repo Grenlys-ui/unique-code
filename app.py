@@ -1,4 +1,5 @@
 import csv
+import ctypes
 import gc
 import json
 import os
@@ -18,7 +19,14 @@ UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# SQLite データベースのセットアップ（重複防止機能）
+# OSレベルでメモリを強制解放する関数
+def trim_memory():
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+
 DB_PATH = "uuid_only_codes.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -34,7 +42,6 @@ def init_db():
 init_db()
 
 def generate_uuid():
-    """8文字のランダムIDを生成し、DBで重複チェック"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     while True:
@@ -47,7 +54,6 @@ def generate_uuid():
             return code
 
 def get_font(font_size):
-    """OSに応じたシステムフォントを取得"""
     system = platform.system()
     font_paths = []
     if system == "Windows":
@@ -66,8 +72,7 @@ def get_font(font_size):
     return ImageFont.load_default()
 
 def create_qr_image(uuid_code, fill_color="black", back_color="white"):
-    """指定した前景色・背景色でQRコード画像を作成"""
-    qr = qrcode.QRCode(version=1, box_size=10, border=2)
+    qr = qrcode.QRCode(version=1, box_size=6, border=2) # box_sizeを小さくして軽量化
     qr.add_data(uuid_code)
     qr.make(fit=True)
 
@@ -86,7 +91,6 @@ def create_qr_image(uuid_code, fill_color="black", back_color="white"):
         return qr.make_image(fill_color=fill_color, back_color=back_color).convert("RGBA")
 
 def draw_outer_text_directional(img, text_str, outer_params):
-    """フレーム外周のUUID描画"""
     width, height = img.size
     txt_layer = Image.new("RGBA", (width, height), (255, 255, 255, 0))
 
@@ -106,7 +110,6 @@ def draw_outer_text_directional(img, text_str, outer_params):
             t_img = t_img.rotate(angle, expand=True, resample=Image.BICUBIC)
         return t_img
 
-    # 上 (Top)
     top_p = outer_params.get("top", {})
     if top_p:
         t_img = create_text_image(text_str, int(top_p.get("size", 14)), top_p.get("color", "#000000"), int(top_p.get("angle", 0)))
@@ -117,7 +120,6 @@ def draw_outer_text_directional(img, text_str, outer_params):
             x = int(width * (i + 0.5) / 4) - tw // 2 + off_x
             txt_layer.paste(t_img, (x, off_y), t_img)
 
-    # 下 (Bottom)
     btm_p = outer_params.get("bottom", {})
     if btm_p:
         t_img = create_text_image(text_str, int(btm_p.get("size", 14)), btm_p.get("color", "#000000"), int(btm_p.get("angle", 0)))
@@ -128,7 +130,6 @@ def draw_outer_text_directional(img, text_str, outer_params):
             x = int(width * (i + 0.5) / 4) - tw // 2 + off_x
             txt_layer.paste(t_img, (x, height - th - off_y), t_img)
 
-    # 左 (Left)
     lft_p = outer_params.get("left", {})
     if lft_p:
         t_img = create_text_image(text_str, int(lft_p.get("size", 14)), lft_p.get("color", "#000000"), int(lft_p.get("angle", 0)))
@@ -139,7 +140,6 @@ def draw_outer_text_directional(img, text_str, outer_params):
             y = int(height * (i + 0.5) / 4) - th // 2 + off_y
             txt_layer.paste(t_img, (off_x, y), t_img)
 
-    # 右 (Right)
     rgt_p = outer_params.get("right", {})
     if rgt_p:
         t_img = create_text_image(text_str, int(rgt_p.get("size", 14)), rgt_p.get("color", "#000000"), int(rgt_p.get("angle", 0)))
@@ -152,7 +152,6 @@ def draw_outer_text_directional(img, text_str, outer_params):
 
     img.alpha_composite(txt_layer)
 
-# (HTML_TEMPLATE は変更なしのため省略せずにそのまま保持)
 HTML_TEMPLATE = """
 <!doctype html>
 <html lang="uz">
@@ -472,18 +471,21 @@ def index():
         outer_params = json.loads(request.form.get("outer_params", "{}"))
         frame_file = request.files.get("frame")
 
-        # 一時ディレクトリの作成（処理完了後に削除）
         temp_dir = tempfile.mkdtemp()
         frame_path = None
 
         if frame_file and frame_file.filename:
             frame_path = os.path.join(temp_dir, "base_frame.png")
-            frame_file.save(frame_path)
+            # メモリ高騰を防ぐため、受取時に画像をリサイズ・圧縮保存
+            uploaded_img = Image.open(frame_file)
+            uploaded_img.thumbnail((1000, 1000), Image.LANCZOS)
+            uploaded_img.save(frame_path, format="PNG", optimize=True)
+            uploaded_img.close()
+            del uploaded_img
 
         zip_path = os.path.join(temp_dir, "qr_uuid_codes.zip")
         csv_data = [["UUID"]]
 
-        # ディスク上に直接ZIPを作成
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
             for i in range(qty):
                 uuid_code = generate_uuid()
@@ -506,7 +508,7 @@ def index():
                         back_color=back_color
                     )
                     qr_size = int(config["size"])
-                    qr_resized = qr_img.resize((qr_size, qr_size), Image.LANCZOS)
+                    qr_resized = qr_img.resize((qr_size, qr_size), Image.NEAREST) # 高速かつ低メモリなリサイズ
 
                     x = int(config["x"])
                     y = int(config["y"])
@@ -520,46 +522,38 @@ def index():
                     pos = config.get("textPosition", "bottom")
 
                     if pos == "bottom":
-                        tx = x + (qr_size // 2)
-                        ty = y + qr_size + margin
-                        anchor = "mt"
+                        tx, ty, anchor = x + (qr_size // 2), y + qr_size + margin, "mt"
                     elif pos == "top":
-                        tx = x + (qr_size // 2)
-                        ty = y - margin
-                        anchor = "mb"
+                        tx, ty, anchor = x + (qr_size // 2), y - margin, "mb"
                     elif pos == "left":
-                        tx = x - margin
-                        ty = y + (qr_size // 2)
-                        anchor = "rm"
+                        tx, ty, anchor = x - margin, y + (qr_size // 2), "rm"
                     elif pos == "right":
-                        tx = x + qr_size + margin
-                        ty = y + (qr_size // 2)
-                        anchor = "lm"
+                        tx, ty, anchor = x + qr_size + margin, y + (qr_size // 2), "lm"
                     else:
-                        tx = x + (qr_size // 2)
-                        ty = y + qr_size + margin
-                        anchor = "mt"
+                        tx, ty, anchor = x + (qr_size // 2), y + qr_size + margin, "mt"
 
                     draw.text((tx, ty), uuid_code, fill=text_color, anchor=anchor, font=font)
 
                     qr_img.close()
                     qr_resized.close()
 
-                # ディスク上の一時ファイルへ保存後、ZIPに追加
+                # PNG保存せずに直接ZIPストリームに追記
                 temp_img_path = os.path.join(temp_dir, f"{uuid_code}.png")
                 final_img = img.convert("RGB")
-                final_img.save(temp_img_path, format="PNG")
+                final_img.save(temp_img_path, format="PNG", optimize=True)
                 
                 zip_file.write(temp_img_path, arcname=f"{uuid_code}.png")
 
-                # 個別ファイルを即座に消去してメモリとディスクを開放
                 final_img.close()
                 img.close()
                 os.remove(temp_img_path)
-                del img, final_img
-                gc.collect()
 
-            # CSVも一時ファイル化して追加
+                del img, final_img
+                
+                # C言語層のメモリまで強制解放
+                gc.collect()
+                trim_memory()
+
             csv_path = os.path.join(temp_dir, "uuid_codes.csv")
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -567,14 +561,12 @@ def index():
             zip_file.write(csv_path, arcname="uuid_codes.csv")
             os.remove(csv_path)
 
-        # レスポンス送信後、一時フォルダごと綺麗に削除する関数
         def cleanup():
             try:
                 shutil.rmtree(temp_dir)
             except Exception:
                 pass
 
-        # send_fileでディスク上のZIPをストリーミング送信
         response = send_file(
             zip_path,
             mimetype="application/zip",
