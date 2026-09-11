@@ -1,11 +1,12 @@
 import csv
-import gc  # メモリ解放用
-from io import BytesIO, StringIO
+import gc
 import json
 import os
 import platform
 import random
 import string
+import shutil
+import tempfile
 import zipfile
 import sqlite3
 from flask import Flask, render_template_string, request, send_file
@@ -151,7 +152,7 @@ def draw_outer_text_directional(img, text_str, outer_params):
 
     img.alpha_composite(txt_layer)
 
-
+# (HTML_TEMPLATE は変更なしのため省略せずにそのまま保持)
 HTML_TEMPLATE = """
 <!doctype html>
 <html lang="uz">
@@ -181,11 +182,9 @@ HTML_TEMPLATE = """
     <label>Yaratiladigan soni (ZIP): <input type="number" name="qty" value="1" min="1" max="10000" required></label><br><br>
     <label>Ramka tasviri (Frame): <input type="file" id="frame-input" name="frame" accept="image/*"></label><br><br>
 
-    <!-- 外周UUIDの設定 -->
     <div class="section-box">
       <h3>Tashqi Atrof Matn Sozlamalari (Outer Text)</h3>
       
-      <!-- Yuqori (上) -->
       <div class="dir-box">
         <b>Yuqori (Tepada):</b><br>
         Rangi: <input type="color" id="out-top-color" value="#000000" onchange="renderPreview()">
@@ -198,7 +197,6 @@ HTML_TEMPLATE = """
         </select>
       </div>
 
-      <!-- Pastki (下) -->
       <div class="dir-box">
         <b>Pastki (Pastda):</b><br>
         Rangi: <input type="color" id="out-bottom-color" value="#000000" onchange="renderPreview()">
@@ -211,7 +209,6 @@ HTML_TEMPLATE = """
         </select>
       </div>
 
-      <!-- Chap (左) -->
       <div class="dir-box">
         <b>Chap tomon:</b><br>
         Rangi: <input type="color" id="out-left-color" value="#000000" onchange="renderPreview()">
@@ -224,7 +221,6 @@ HTML_TEMPLATE = """
         </select>
       </div>
 
-      <!-- O'ng (右) -->
       <div class="dir-box">
         <b>O'ng tomon:</b><br>
         Rangi: <input type="color" id="out-right-color" value="#000000" onchange="renderPreview()">
@@ -238,7 +234,6 @@ HTML_TEMPLATE = """
       </div>
     </div>
 
-    <!-- QR Kodlar sozlamalari -->
     <div class="section-box">
       <label>Bitta ramkadagi QR kodlar soni: 
         <input type="number" id="qr-count" name="qr_count" value="1" min="1" max="10">
@@ -384,7 +379,6 @@ function renderPreview() {
     ctx.restore();
   };
 
-  // 外周テキスト描画
   ['top', 'bottom'].forEach(d => {
     const color = getOuterVal(d, 'color');
     const size = parseInt(getOuterVal(d, 'size')) || 14;
@@ -409,7 +403,6 @@ function renderPreview() {
     }
   });
 
-  // QRコードおよび指定位置・距離のテキスト描画
   qrConfigs.forEach((cfg) => {
     if (!cfg.isTransparent) {
       ctx.fillStyle = cfg.backColor;
@@ -479,21 +472,25 @@ def index():
         outer_params = json.loads(request.form.get("outer_params", "{}"))
         frame_file = request.files.get("frame")
 
-        frame_bytes = None
-        if frame_file and frame_file.filename:
-            frame_bytes = frame_file.read()  # メモリ節約のためバイト列で保持
+        # 一時ディレクトリの作成（処理完了後に削除）
+        temp_dir = tempfile.mkdtemp()
+        frame_path = None
 
-        zip_buffer = BytesIO()
+        if frame_file and frame_file.filename:
+            frame_path = os.path.join(temp_dir, "base_frame.png")
+            frame_file.save(frame_path)
+
+        zip_path = os.path.join(temp_dir, "qr_uuid_codes.zip")
         csv_data = [["UUID"]]
 
-        # 圧縮レベルを指定してZIPファイルを作成（ZIP_DEFLATED）
-        with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        # ディスク上に直接ZIPを作成
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
             for i in range(qty):
                 uuid_code = generate_uuid()
                 csv_data.append([uuid_code])
 
-                if frame_bytes:
-                    img = Image.open(BytesIO(frame_bytes)).convert("RGBA")
+                if frame_path:
+                    img = Image.open(frame_path).convert("RGBA")
                 else:
                     img = Image.new("RGBA", (600, 600), (255, 255, 255, 255))
 
@@ -544,38 +541,48 @@ def index():
                         anchor = "mt"
 
                     draw.text((tx, ty), uuid_code, fill=text_color, anchor=anchor, font=font)
-                    
-                    # 個別パーツのメモリ解放
+
                     qr_img.close()
                     qr_resized.close()
 
+                # ディスク上の一時ファイルへ保存後、ZIPに追加
+                temp_img_path = os.path.join(temp_dir, f"{uuid_code}.png")
                 final_img = img.convert("RGB")
-                img_buffer = BytesIO()
-                final_img.save(img_buffer, format="PNG", optimize=True)
+                final_img.save(temp_img_path, format="PNG")
                 
-                # ZIPへ書き込み
-                zip_file.writestr(f"{uuid_code}.png", img_buffer.getvalue())
+                zip_file.write(temp_img_path, arcname=f"{uuid_code}.png")
 
-                # 明示的にメモリ解放を実行
-                img_buffer.close()
+                # 個別ファイルを即座に消去してメモリとディスクを開放
                 final_img.close()
                 img.close()
-                del img, final_img, img_buffer
+                os.remove(temp_img_path)
+                del img, final_img
                 gc.collect()
 
-            csv_buffer = StringIO()
-            writer = csv.writer(csv_buffer)
-            writer.writerows(csv_data)
-            zip_file.writestr("uuid_codes.csv", csv_buffer.getvalue())
-            csv_buffer.close()
+            # CSVも一時ファイル化して追加
+            csv_path = os.path.join(temp_dir, "uuid_codes.csv")
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerows(csv_data)
+            zip_file.write(csv_path, arcname="uuid_codes.csv")
+            os.remove(csv_path)
 
-        zip_buffer.seek(0)
-        return send_file(
-            zip_buffer,
+        # レスポンス送信後、一時フォルダごと綺麗に削除する関数
+        def cleanup():
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+
+        # send_fileでディスク上のZIPをストリーミング送信
+        response = send_file(
+            zip_path,
             mimetype="application/zip",
             as_attachment=True,
             download_name="qr_uuid_codes.zip"
         )
+        response.call_on_close(cleanup)
+        return response
 
     return render_template_string(HTML_TEMPLATE)
 
